@@ -1,0 +1,25 @@
+[package]
+name = "fow_rl-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pyo3 = "0.23.3"
+
+[dependencies.fow_rl]
+path = ".."
+features = ["fuzzing"]
+
+[[bin]]
+name = "python_vs_rust"
+path = "fuzz_targets/python_vs_rust.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

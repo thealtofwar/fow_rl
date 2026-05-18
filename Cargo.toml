@@ -1,0 +1,17 @@
+[package]
+name = "fow_rl"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "fow_rl"
+crate-type = ["rlib"]
+
+[dependencies]
+pyo3 = "0.28.3"
+chess = "3.2"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+fuzzing = []
