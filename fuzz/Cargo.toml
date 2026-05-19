@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-pyo3 = "0.23.3"
+pyo3 = "0.28.3"
 
 [dependencies.fow_rl]
 path = ".."

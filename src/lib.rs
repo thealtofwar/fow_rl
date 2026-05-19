@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use chess::{
@@ -9,10 +9,18 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-const HISTORY_LEN: usize = 8;
-const SLICE_CHANNELS: usize = 13;
-const CASTLING_CHANNELS: usize = 2;
 const BOARD_SQUARES: usize = 64;
+const ENCODE_CHANNELS: usize = 35;
+const OBS_EMPTY_CHANNEL: usize = 12;
+const OBS_FOG_CHANNEL: usize = 13;
+const MEMORY_OFFSET: usize = 14;
+const MEMORY_EMPTY_CHANNEL: usize = 12;
+const RECENCY_CHANNEL: usize = 27;
+const CASTLING_KS_CHANNEL: usize = 28;
+const CASTLING_QS_CHANNEL: usize = 29;
+const CPV_OFFSET: usize = 30;
+const CPV_LEN: usize = 5;
+const INITIAL_DELTA_T: f32 = 100.0;
 const PROMOTION_BASE: usize = 4096;
 
 const FILES: [File; 8] = [
@@ -87,6 +95,26 @@ fn promotion_index(piece: Piece) -> Option<usize> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct SeenPiece {
+    piece: Piece,
+    color: Color,
+}
+
+fn color_index(color: Color) -> usize {
+    match color {
+        Color::White => 0,
+        Color::Black => 1,
+    }
+}
+
+fn opposite_color(color: Color) -> Color {
+    match color {
+        Color::White => Color::Black,
+        Color::Black => Color::White,
+    }
+}
+
 fn reshape_rows(data: Vec<f32>, cols: usize) -> Vec<Vec<f32>> {
     data.chunks(cols).map(|chunk| chunk.to_vec()).collect()
 }
@@ -110,78 +138,6 @@ fn fen_from_py(board_obj: &Bound<'_, PyAny>) -> PyResult<String> {
     ))
 }
 
-fn flatten_matrix(matrix: Vec<Vec<f32>>) -> PyResult<Vec<f32>> {
-    if matrix.len() != BOARD_SQUARES {
-        return Err(PyValueError::new_err(format!(
-            "history_tensors entries must have {} rows",
-            BOARD_SQUARES
-        )));
-    }
-
-    let mut flat = Vec::with_capacity(BOARD_SQUARES * SLICE_CHANNELS);
-    for row in matrix {
-        if row.len() != SLICE_CHANNELS {
-            return Err(PyValueError::new_err(format!(
-                "history_tensors entries must have {} columns",
-                SLICE_CHANNELS
-            )));
-        }
-        flat.extend_from_slice(&row);
-    }
-
-    Ok(flat)
-}
-
-fn validate_flat(flat: Vec<f32>) -> PyResult<Vec<f32>> {
-    if flat.len() != BOARD_SQUARES * SLICE_CHANNELS {
-        return Err(PyValueError::new_err(format!(
-            "history_tensors entries must have length {}",
-            BOARD_SQUARES * SLICE_CHANNELS
-        )));
-    }
-    Ok(flat)
-}
-
-fn tensor_to_flat(tensor_obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
-    if let Ok(matrix) = tensor_obj.extract::<Vec<Vec<f32>>>() {
-        return flatten_matrix(matrix);
-    }
-    if let Ok(flat) = tensor_obj.extract::<Vec<f32>>() {
-        return validate_flat(flat);
-    }
-
-    if let Ok(tolist) = tensor_obj.getattr("tolist") {
-        if tolist.is_callable() {
-            let list_obj = tolist.call0()?;
-            if let Ok(matrix) = list_obj.extract::<Vec<Vec<f32>>>() {
-                return flatten_matrix(matrix);
-            }
-            if let Ok(flat) = list_obj.extract::<Vec<f32>>() {
-                return validate_flat(flat);
-            }
-        }
-    }
-
-    Err(PyValueError::new_err(
-        "history_tensors entries must be 64x13 tensors or lists",
-    ))
-}
-
-fn history_from_py(history_obj: &Bound<'_, PyAny>) -> PyResult<VecDeque<Vec<f32>>> {
-    let mut deque = VecDeque::new();
-
-    for item in history_obj.try_iter()? {
-        let item = item?;
-        let flat = tensor_to_flat(&item)?;
-        deque.push_back(flat);
-    }
-
-    while deque.len() > HISTORY_LEN {
-        deque.pop_front();
-    }
-
-    Ok(deque)
-}
 
 fn uci_from_py(action_obj: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok(uci) = action_obj.extract::<String>() {
@@ -206,20 +162,19 @@ fn uci_from_py(action_obj: &Bound<'_, PyAny>) -> PyResult<String> {
 #[derive(Clone)]
 pub struct SelfPlayGame {
     board: Board,
-    history_tensors: VecDeque<Vec<f32>>,
+    mental_pieces: [[Option<SeenPiece>; BOARD_SQUARES]; 2],
+    delta_t: [[f32; BOARD_SQUARES]; 2],
 }
 
 impl SelfPlayGame {
-    fn new_internal(board: Board, history_tensors: Option<VecDeque<Vec<f32>>>) -> Self {
+    fn new_internal(board: Board) -> Self {
         let mut game = SelfPlayGame {
             board,
-            history_tensors: history_tensors.unwrap_or_default(),
+            mental_pieces: [[None; BOARD_SQUARES]; 2],
+            delta_t: [[INITIAL_DELTA_T; BOARD_SQUARES]; 2],
         };
 
-        if game.history_tensors.is_empty() {
-            game.save_history_state();
-        }
-
+        game.update_mental_boards();
         game
     }
 
@@ -227,43 +182,25 @@ impl SelfPlayGame {
         self.board.side_to_move()
     }
 
-    fn push_history(&mut self, slice: Vec<f32>) {
-        if self.history_tensors.len() == HISTORY_LEN {
-            self.history_tensors.pop_front();
-        }
-        self.history_tensors.push_back(slice);
-    }
-
-    fn save_history_state(&mut self) {
+    fn update_mental_boards(&mut self) {
         let current_player = self.side_to_move();
+        let player_idx = color_index(current_player);
         let visible_squares = self.compute_visibility(current_player);
 
-        let mut slice_tensor = vec![0.0; BOARD_SQUARES * SLICE_CHANNELS];
-
         for index in 0..BOARD_SQUARES {
-            let view_index = if current_player == Color::White {
-                index
+            if visible_squares.contains(&index) {
+                let square = square_from_index(index);
+                let piece = self.board.piece_on(square);
+                let color = self.board.color_on(square);
+                self.mental_pieces[player_idx][index] = match (piece, color) {
+                    (Some(piece), Some(color)) => Some(SeenPiece { piece, color }),
+                    _ => None,
+                };
+                self.delta_t[player_idx][index] = 0.0;
             } else {
-                mirror_index(index)
-            };
-
-            if !visible_squares.contains(&index) {
-                slice_tensor[view_index * SLICE_CHANNELS + 12] = 1.0;
-                continue;
-            }
-
-            let square = square_from_index(index);
-            if let Some(piece) = self.board.piece_on(square) {
-                let is_own_piece = self.board.color_on(square) == Some(current_player);
-                let mut piece_idx = piece_base_index(piece);
-                if !is_own_piece {
-                    piece_idx += 6;
-                }
-                slice_tensor[view_index * SLICE_CHANNELS + piece_idx] = 1.0;
+                self.delta_t[player_idx][index] += 1.0;
             }
         }
-
-        self.push_history(slice_tensor);
     }
 
     fn board_matrix(&self) -> Vec<Vec<i8>> {
@@ -298,7 +235,7 @@ impl SelfPlayGame {
 
     fn apply_internal(&mut self, action: ChessMove) {
         self.board = self.board.make_move_new(action);
-        self.save_history_state();
+        self.update_mental_boards();
     }
 
     fn is_terminal_internal(&self) -> bool {
@@ -372,53 +309,94 @@ impl SelfPlayGame {
         visible
     }
 
-    fn encode_flat(&self) -> Vec<f32> {
-        let mut history_list: Vec<Vec<f32>> = if self.history_tensors.is_empty() {
-            vec![vec![0.0; BOARD_SQUARES * SLICE_CHANNELS]]
+    fn captured_piece_vector(&self, current_player: Color) -> [f32; CPV_LEN] {
+        let enemy = opposite_color(current_player);
+        let counts = [
+            (Piece::Pawn, 8.0_f32),
+            (Piece::Knight, 2.0_f32),
+            (Piece::Bishop, 2.0_f32),
+            (Piece::Rook, 2.0_f32),
+            (Piece::Queen, 1.0_f32),
+        ];
+
+        let mut cpv = [0.0_f32; CPV_LEN];
+        for (idx, (piece, max_count)) in counts.iter().enumerate() {
+            let current = (*self.board.pieces(*piece) & *self.board.color_combined(enemy))
+                .popcnt() as f32;
+            cpv[idx] = (max_count - current) / max_count;
+        }
+
+        cpv
+    }
+
+    pub(crate) fn encode_flat(&self) -> Vec<f32> {
+        self.encode_flat_with_oracle(false)
+    }
+
+    fn encode_flat_with_oracle(&self, oracle: bool) -> Vec<f32> {
+        let current_player = self.side_to_move();
+        let player_idx = color_index(current_player);
+        let visible_squares = if oracle {
+            None
         } else {
-            self.history_tensors.iter().cloned().collect()
+            Some(self.compute_visibility(current_player))
         };
 
-        while history_list.len() < HISTORY_LEN {
-            let first = history_list[0].clone();
-            history_list.insert(0, first);
+        let mut encoded = vec![0.0; BOARD_SQUARES * ENCODE_CHANNELS];
+
+        let cpv = self.captured_piece_vector(current_player);
+        for square in 0..BOARD_SQUARES {
+            let base = square * ENCODE_CHANNELS + CPV_OFFSET;
+            encoded[base..base + CPV_LEN].copy_from_slice(&cpv);
         }
 
-        let history_channels = SLICE_CHANNELS * HISTORY_LEN;
-        let mut tensor = vec![0.0; BOARD_SQUARES * history_channels];
+        for index in 0..BOARD_SQUARES {
+            let view_index = if current_player == Color::White {
+                index
+            } else {
+                mirror_index(index)
+            };
+            let base = view_index * ENCODE_CHANNELS;
+            let square = square_from_index(index);
 
-        for square in 0..BOARD_SQUARES {
-            for (idx, slice) in history_list.iter().enumerate() {
-                let dst_base = square * history_channels + idx * SLICE_CHANNELS;
-                let src_base = square * SLICE_CHANNELS;
-                tensor[dst_base..dst_base + SLICE_CHANNELS]
-                    .copy_from_slice(&slice[src_base..src_base + SLICE_CHANNELS]);
+            let is_visible = visible_squares
+                .as_ref()
+                .map(|set| set.contains(&index))
+                .unwrap_or(true);
+
+            if !is_visible {
+                encoded[base + OBS_FOG_CHANNEL] = 1.0;
+            } else if let Some(piece) = self.board.piece_on(square) {
+                let is_own_piece = self.board.color_on(square) == Some(current_player);
+                let mut piece_idx = piece_base_index(piece);
+                if !is_own_piece {
+                    piece_idx += 6;
+                }
+                encoded[base + piece_idx] = 1.0;
+            } else {
+                encoded[base + OBS_EMPTY_CHANNEL] = 1.0;
             }
+
+            match self.mental_pieces[player_idx][index] {
+                Some(seen) => {
+                    let mut piece_idx = piece_base_index(seen.piece);
+                    if seen.color != current_player {
+                        piece_idx += 6;
+                    }
+                    encoded[base + MEMORY_OFFSET + piece_idx] = 1.0;
+                }
+                None => {
+                    encoded[base + MEMORY_OFFSET + MEMORY_EMPTY_CHANNEL] = 1.0;
+                }
+            }
+
+            let dt = self.delta_t[player_idx][index];
+            encoded[base + RECENCY_CHANNEL] = 1.0 / (1.0 + dt);
         }
 
-        let mut castling_channel = vec![0.0; BOARD_SQUARES * CASTLING_CHANNELS];
         let (king_side, queen_side) = self.castle_eligible_internal();
-        let king_val = if king_side { 1.0 } else { 0.0 };
-        let queen_val = if queen_side { 1.0 } else { 0.0 };
-
-        if BOARD_SQUARES >= 2 {
-            castling_channel[0] += king_val;
-            castling_channel[1] += king_val;
-            castling_channel[2] += queen_val;
-            castling_channel[3] += queen_val;
-        }
-
-        let mut encoded = vec![0.0; BOARD_SQUARES * (history_channels + CASTLING_CHANNELS)];
-        for square in 0..BOARD_SQUARES {
-            let dst_base = square * (history_channels + CASTLING_CHANNELS);
-            let src_base = square * history_channels;
-            encoded[dst_base..dst_base + history_channels]
-                .copy_from_slice(&tensor[src_base..src_base + history_channels]);
-
-            let castling_base = square * CASTLING_CHANNELS;
-            encoded[dst_base + history_channels..dst_base + history_channels + CASTLING_CHANNELS]
-                .copy_from_slice(&castling_channel[castling_base..castling_base + CASTLING_CHANNELS]);
-        }
+        encoded[CASTLING_KS_CHANNEL] = if king_side { 1.0 } else { 0.0 };
+        encoded[ENCODE_CHANNELS + CASTLING_QS_CHANNEL] = if queen_side { 1.0 } else { 0.0 };
 
         encoded
     }
@@ -445,12 +423,8 @@ impl SelfPlayGame {
 #[pymethods]
 impl SelfPlayGame {
     #[new]
-    #[pyo3(signature = (board=None, history_tensors=None))]
-    fn new(
-        py: Python,
-        board: Option<Py<PyAny>>,
-        history_tensors: Option<Py<PyAny>>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (board=None))]
+    fn new(py: Python, board: Option<Py<PyAny>>) -> PyResult<Self> {
         let board = match board {
             Some(obj) => {
                 let bound = obj.bind(py);
@@ -460,15 +434,7 @@ impl SelfPlayGame {
             None => Board::default(),
         };
 
-        let history_deque = match history_tensors {
-            Some(obj) => {
-                let bound = obj.bind(py);
-                Some(history_from_py(&bound)?)
-            }
-            None => None,
-        };
-
-        Ok(SelfPlayGame::new_internal(board, history_deque))
+        Ok(SelfPlayGame::new_internal(board))
     }
 
     #[getter]
@@ -527,9 +493,10 @@ impl SelfPlayGame {
         self.terminal_value_internal(player)
     }
 
-    fn encode(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let flat = self.encode_flat();
-        let cols = SLICE_CHANNELS * HISTORY_LEN + CASTLING_CHANNELS;
+    #[pyo3(signature = (oracle = false))]
+    fn encode(&self, py: Python, oracle: bool) -> PyResult<Py<PyAny>> {
+        let flat = self.encode_flat_with_oracle(oracle);
+        let cols = ENCODE_CHANNELS;
         let rows = reshape_rows(flat, cols);
 
         let torch = PyModule::import(py, "torch")
@@ -563,7 +530,7 @@ pub mod fuzzing {
     use super::*;
 
     pub fn new_default_game() -> SelfPlayGame {
-        SelfPlayGame::new_internal(Board::default(), None)
+        SelfPlayGame::new_internal(Board::default())
     }
 
     pub fn apply(game: &mut SelfPlayGame, action: ChessMove) {
@@ -605,7 +572,6 @@ mod tests {
     const PY_SELFPLAY_CODE: &str = r#"
 import chess
 import torch
-from collections import deque
 
 _PROMOTION_PIECE_ORDER = {
     chess.QUEEN: 0,
@@ -617,38 +583,29 @@ _PROMOTION_OPTION_COUNT = len(_PROMOTION_PIECE_ORDER)
 
 
 class SelfPlayGame:
-    """Mutable game-state protocol consumed by PPO for Fog of War Chess."""
+    """Mutable game-state tracker managing hidden states for Fog of War Chess."""
 
-    def __init__(self, board: chess.Board = None, history_tensors: deque = None):
+    def __init__(self, board: chess.Board = None):
         self._board = board if board else chess.Board()
 
-        if history_tensors is not None:
-            self._history_tensors = history_tensors
-        else:
-            self._history_tensors = deque(maxlen=8)
-            self._save_history_state()
+        self._mental_pieces = {True: [None] * 64, False: [None] * 64}
+        self._delta_t = {
+            True: torch.full((64,), 100.0, dtype=torch.float32),
+            False: torch.full((64,), 100.0, dtype=torch.float32),
+        }
 
-    def _save_history_state(self) -> None:
+        self._update_mental_boards()
+
+    def _update_mental_boards(self) -> None:
         current_player = self.turn
         visible_squares = self._compute_visibility(self._board, current_player)
 
-        slice_tensor = torch.zeros((64, 13), dtype=torch.float32)
-
         for sq in chess.SQUARES:
-            view_sq = sq if current_player == chess.WHITE else chess.square_mirror(sq)
-
-            if sq not in visible_squares:
-                slice_tensor[view_sq, 12] = 1.0
+            if sq in visible_squares:
+                self._mental_pieces[current_player][sq] = self._board.piece_at(sq)
+                self._delta_t[current_player][sq] = 0.0
             else:
-                piece = self._board.piece_at(sq)
-                if piece is not None:
-                    is_own_piece = (piece.color == current_player)
-                    piece_idx = piece.piece_type - 1
-                    if not is_own_piece:
-                        piece_idx += 6
-                    slice_tensor[view_sq, piece_idx] = 1.0
-
-        self._history_tensors.append(slice_tensor)
+                self._delta_t[current_player][sq] += 1.0
 
     @property
     def turn(self) -> bool:
@@ -676,8 +633,16 @@ class SelfPlayGame:
         )
 
     def clone(self):
-        cloned_history = deque([t.clone() for t in self._history_tensors], maxlen=8)
-        return SelfPlayGame(board=self._board.copy(), history_tensors=cloned_history)
+        cloned = SelfPlayGame(board=self._board.copy())
+        cloned._mental_pieces = {
+            True: list(self._mental_pieces[True]),
+            False: list(self._mental_pieces[False]),
+        }
+        cloned._delta_t = {
+            True: self._delta_t[True].clone(),
+            False: self._delta_t[False].clone(),
+        }
+        return cloned
 
     def current_player(self):
         return self.turn
@@ -687,7 +652,7 @@ class SelfPlayGame:
 
     def apply(self, action):
         self._board.push(action)
-        self._save_history_state()
+        self._update_mental_boards()
 
     def is_terminal(self) -> bool:
         return (self._board.king(chess.WHITE) is None) or (
@@ -724,20 +689,71 @@ class SelfPlayGame:
                                 visible.add(sq + 2 * forward_offset)
         return visible
 
-    def encode(self):
-        history_list = list(self._history_tensors)
-        while len(history_list) < 8:
-            history_list.insert(0, history_list[0])
+    def encode(self, oracle: bool = False):
+        current_player = self.turn
 
-        tensor = torch.cat(history_list, dim=1)
+        if oracle:
+            visible_squares = set(chess.SQUARES)
+        else:
+            visible_squares = self._compute_visibility(self._board, current_player)
+
+        encoded = torch.zeros((64, 35), dtype=torch.float32)
+
+        max_counts = {
+            chess.PAWN: 8.0,
+            chess.KNIGHT: 2.0,
+            chess.BISHOP: 2.0,
+            chess.ROOK: 2.0,
+            chess.QUEEN: 1.0,
+        }
+        current_counts = {
+            chess.PAWN: 0,
+            chess.KNIGHT: 0,
+            chess.BISHOP: 0,
+            chess.ROOK: 0,
+            chess.QUEEN: 0,
+        }
+        enemy_color = not current_player
+
+        for piece in self._board.piece_map().values():
+            if piece.color == enemy_color and piece.piece_type != chess.KING:
+                current_counts[piece.piece_type] += 1
+
+        cpv = [
+            (max_counts[pt] - current_counts[pt]) / max_counts[pt]
+            for pt in [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+        ]
+
+        encoded[:, 30:35] = torch.tensor(cpv, dtype=torch.float32)
+
+        for sq in chess.SQUARES:
+            view_sq = sq if current_player == chess.WHITE else chess.square_mirror(sq)
+
+            if sq not in visible_squares:
+                encoded[view_sq, 13] = 1.0
+            else:
+                piece = self._board.piece_at(sq)
+                if piece is None:
+                    encoded[view_sq, 12] = 1.0
+                else:
+                    p_idx = piece.piece_type - 1 if piece.color == current_player else piece.piece_type + 5
+                    encoded[view_sq, p_idx] = 1.0
+
+            old_piece = self._mental_pieces[current_player][sq]
+            if old_piece is None:
+                encoded[view_sq, 14 + 12] = 1.0
+            else:
+                p_idx = old_piece.piece_type - 1 if old_piece.color == current_player else old_piece.piece_type + 5
+                encoded[view_sq, 14 + p_idx] = 1.0
+
+            dt = self._delta_t[current_player][sq]
+            encoded[view_sq, 27] = 1.0 / (1.0 + dt)
 
         castle_eligibility = self.castle_eligible()
+        encoded[0, 28] = float(castle_eligibility[0])
+        encoded[1, 29] = float(castle_eligibility[1])
 
-        castling_channel = torch.zeros((64, 2), dtype=torch.float32)
-        castling_channel[0] += castle_eligibility[0]
-        castling_channel[1] += castle_eligibility[1]
-
-        return torch.cat([tensor, castling_channel], dim=1)
+        return encoded
 
     def action_index(self, action):
         from_sq = action.from_square
@@ -802,7 +818,7 @@ class SelfPlayGame:
             let module = python_selfplay_module(py)?;
             let cls = module.getattr("SelfPlayGame")?;
             let py_game = cls.call0()?;
-            let rust_game = SelfPlayGame::new_internal(Board::default(), None);
+            let rust_game = SelfPlayGame::new_internal(Board::default());
 
             let py_turn: bool = py_game.getattr("turn")?.extract()?;
             assert_eq!(rust_game.side_to_move() == Color::White, py_turn);
@@ -844,7 +860,7 @@ class SelfPlayGame:
             let module = python_selfplay_module(py)?;
             let cls = module.getattr("SelfPlayGame")?;
             let py_game = cls.call0()?;
-            let mut rust_game = SelfPlayGame::new_internal(Board::default(), None);
+            let mut rust_game = SelfPlayGame::new_internal(Board::default());
 
             for uci in ["e2e4", "e7e5", "g1f3"] {
                 let mv = chess_mod
@@ -892,7 +908,7 @@ class SelfPlayGame:
             let py_game = cls.call1((py_board,))?;
 
             let rust_board = Board::from_str(fen).unwrap();
-            let rust_game = SelfPlayGame::new_internal(rust_board, None);
+            let rust_game = SelfPlayGame::new_internal(rust_board);
 
             let mv = chess_mod
                 .getattr("Move")?

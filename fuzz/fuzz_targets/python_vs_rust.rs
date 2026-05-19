@@ -13,7 +13,6 @@ static MODULE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const PY_SELFPLAY_CODE: &str = r#"
 import chess
 import torch
-from collections import deque
 
 _PROMOTION_PIECE_ORDER = {
     chess.QUEEN: 0,
@@ -25,38 +24,29 @@ _PROMOTION_OPTION_COUNT = len(_PROMOTION_PIECE_ORDER)
 
 
 class SelfPlayGame:
-    """Mutable game-state protocol consumed by PPO for Fog of War Chess."""
+    """Mutable game-state tracker managing hidden states for Fog of War Chess."""
 
-    def __init__(self, board: chess.Board = None, history_tensors: deque = None):
+    def __init__(self, board: chess.Board = None):
         self._board = board if board else chess.Board()
 
-        if history_tensors is not None:
-            self._history_tensors = history_tensors
-        else:
-            self._history_tensors = deque(maxlen=8)
-            self._save_history_state()
+        self._mental_pieces = {True: [None] * 64, False: [None] * 64}
+        self._delta_t = {
+            True: torch.full((64,), 100.0, dtype=torch.float32),
+            False: torch.full((64,), 100.0, dtype=torch.float32),
+        }
 
-    def _save_history_state(self) -> None:
+        self._update_mental_boards()
+
+    def _update_mental_boards(self) -> None:
         current_player = self.turn
         visible_squares = self._compute_visibility(self._board, current_player)
 
-        slice_tensor = torch.zeros((64, 13), dtype=torch.float32)
-
         for sq in chess.SQUARES:
-            view_sq = sq if current_player == chess.WHITE else chess.square_mirror(sq)
-
-            if sq not in visible_squares:
-                slice_tensor[view_sq, 12] = 1.0
+            if sq in visible_squares:
+                self._mental_pieces[current_player][sq] = self._board.piece_at(sq)
+                self._delta_t[current_player][sq] = 0.0
             else:
-                piece = self._board.piece_at(sq)
-                if piece is not None:
-                    is_own_piece = (piece.color == current_player)
-                    piece_idx = piece.piece_type - 1
-                    if not is_own_piece:
-                        piece_idx += 6
-                    slice_tensor[view_sq, piece_idx] = 1.0
-
-        self._history_tensors.append(slice_tensor)
+                self._delta_t[current_player][sq] += 1.0
 
     @property
     def turn(self) -> bool:
@@ -84,8 +74,16 @@ class SelfPlayGame:
         )
 
     def clone(self):
-        cloned_history = deque([t.clone() for t in self._history_tensors], maxlen=8)
-        return SelfPlayGame(board=self._board.copy(), history_tensors=cloned_history)
+        cloned = SelfPlayGame(board=self._board.copy())
+        cloned._mental_pieces = {
+            True: list(self._mental_pieces[True]),
+            False: list(self._mental_pieces[False]),
+        }
+        cloned._delta_t = {
+            True: self._delta_t[True].clone(),
+            False: self._delta_t[False].clone(),
+        }
+        return cloned
 
     def current_player(self):
         return self.turn
@@ -95,7 +93,7 @@ class SelfPlayGame:
 
     def apply(self, action):
         self._board.push(action)
-        self._save_history_state()
+        self._update_mental_boards()
 
     def is_terminal(self) -> bool:
         return (self._board.king(chess.WHITE) is None) or (
@@ -132,20 +130,71 @@ class SelfPlayGame:
                                 visible.add(sq + 2 * forward_offset)
         return visible
 
-    def encode(self):
-        history_list = list(self._history_tensors)
-        while len(history_list) < 8:
-            history_list.insert(0, history_list[0])
+    def encode(self, oracle: bool = False):
+        current_player = self.turn
 
-        tensor = torch.cat(history_list, dim=1)
+        if oracle:
+            visible_squares = set(chess.SQUARES)
+        else:
+            visible_squares = self._compute_visibility(self._board, current_player)
+
+        encoded = torch.zeros((64, 35), dtype=torch.float32)
+
+        max_counts = {
+            chess.PAWN: 8.0,
+            chess.KNIGHT: 2.0,
+            chess.BISHOP: 2.0,
+            chess.ROOK: 2.0,
+            chess.QUEEN: 1.0,
+        }
+        current_counts = {
+            chess.PAWN: 0,
+            chess.KNIGHT: 0,
+            chess.BISHOP: 0,
+            chess.ROOK: 0,
+            chess.QUEEN: 0,
+        }
+        enemy_color = not current_player
+
+        for piece in self._board.piece_map().values():
+            if piece.color == enemy_color and piece.piece_type != chess.KING:
+                current_counts[piece.piece_type] += 1
+
+        cpv = [
+            (max_counts[pt] - current_counts[pt]) / max_counts[pt]
+            for pt in [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+        ]
+
+        encoded[:, 30:35] = torch.tensor(cpv, dtype=torch.float32)
+
+        for sq in chess.SQUARES:
+            view_sq = sq if current_player == chess.WHITE else chess.square_mirror(sq)
+
+            if sq not in visible_squares:
+                encoded[view_sq, 13] = 1.0
+            else:
+                piece = self._board.piece_at(sq)
+                if piece is None:
+                    encoded[view_sq, 12] = 1.0
+                else:
+                    p_idx = piece.piece_type - 1 if piece.color == current_player else piece.piece_type + 5
+                    encoded[view_sq, p_idx] = 1.0
+
+            old_piece = self._mental_pieces[current_player][sq]
+            if old_piece is None:
+                encoded[view_sq, 14 + 12] = 1.0
+            else:
+                p_idx = old_piece.piece_type - 1 if old_piece.color == current_player else old_piece.piece_type + 5
+                encoded[view_sq, 14 + p_idx] = 1.0
+
+            dt = self._delta_t[current_player][sq]
+            encoded[view_sq, 27] = 1.0 / (1.0 + dt)
 
         castle_eligibility = self.castle_eligible()
+        encoded[0, 28] = float(castle_eligibility[0])
+        encoded[1, 29] = float(castle_eligibility[1])
 
-        castling_channel = torch.zeros((64, 2), dtype=torch.float32)
-        castling_channel[0] += castle_eligibility[0]
-        castling_channel[1] += castle_eligibility[1]
-
-        return torch.cat([tensor, castling_channel], dim=1)
+        return encoded
 
     def action_index(self, action):
         from_sq = action.from_square
@@ -165,7 +214,7 @@ class SelfPlayGame:
 "#;
 
 fn ensure_python() {
-    PY_INIT.call_once(pyo3::prepare_freethreaded_python);
+    PY_INIT.call_once(Python::initialize);
 }
 
 fn python_selfplay_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
@@ -230,7 +279,7 @@ fn compare_state(py_game: &Bound<'_, PyAny>, rust_game: &fow_rl::SelfPlayGame) -
 fuzz_target!(|data: &[u8]| {
     ensure_python();
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let chess_mod = match PyModule::import(py, "chess") {
             Ok(module) => module,
             Err(_) => return,
