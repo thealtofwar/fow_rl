@@ -1,9 +1,8 @@
-use std::collections::HashSet;
 use std::str::FromStr;
 
 use chess::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_rook_moves, Board,
-    BitBoard, ChessMove, Color, File, MoveGen, Piece, Rank, Square, EMPTY,
+    get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_pawn_quiets,
+    get_rook_moves, Board, BitBoard, ChessMove, Color, File, Piece, Rank, Square, EMPTY,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -95,6 +94,20 @@ fn promotion_index(piece: Piece) -> Option<usize> {
     }
 }
 
+fn is_promotion_square(square: Square, color: Color) -> bool {
+    match color {
+        Color::White => square.get_rank() == Rank::Eighth,
+        Color::Black => square.get_rank() == Rank::First,
+    }
+}
+
+fn push_promotion_moves(moves: &mut Vec<ChessMove>, source: Square, dest: Square) {
+    moves.push(ChessMove::new(source, dest, Some(Piece::Queen)));
+    moves.push(ChessMove::new(source, dest, Some(Piece::Rook)));
+    moves.push(ChessMove::new(source, dest, Some(Piece::Bishop)));
+    moves.push(ChessMove::new(source, dest, Some(Piece::Knight)));
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct SeenPiece {
     piece: Piece,
@@ -164,6 +177,7 @@ pub struct SelfPlayGame {
     board: Board,
     mental_pieces: [[Option<SeenPiece>; BOARD_SQUARES]; 2],
     delta_t: [[f32; BOARD_SQUARES]; 2],
+    captured_king: Option<Color>,
 }
 
 impl SelfPlayGame {
@@ -172,6 +186,7 @@ impl SelfPlayGame {
             board,
             mental_pieces: [[None; BOARD_SQUARES]; 2],
             delta_t: [[INITIAL_DELTA_T; BOARD_SQUARES]; 2],
+            captured_king: None,
         };
 
         game.update_mental_boards();
@@ -185,11 +200,13 @@ impl SelfPlayGame {
     fn update_mental_boards(&mut self) {
         let current_player = self.side_to_move();
         let player_idx = color_index(current_player);
-        let visible_squares = self.compute_visibility(current_player);
+        let visible_squares = self.compute_visibility_bb(current_player);
 
         for index in 0..BOARD_SQUARES {
-            if visible_squares.contains(&index) {
-                let square = square_from_index(index);
+            let square = square_from_index(index);
+            let square_bb = BitBoard::from_square(square);
+            let is_visible = (visible_squares & square_bb) != EMPTY;
+            if is_visible {
                 let piece = self.board.piece_on(square);
                 let color = self.board.color_on(square);
                 self.mental_pieces[player_idx][index] = match (piece, color) {
@@ -230,11 +247,165 @@ impl SelfPlayGame {
     }
 
     fn legal_actions_internal(&self) -> Vec<ChessMove> {
-        MoveGen::new_legal(&self.board).collect()
+        let color = self.side_to_move();
+        let own = *self.board.color_combined(color);
+        let enemy = *self.board.color_combined(opposite_color(color));
+        let occupied = *self.board.combined();
+        let mut moves = Vec::new();
+
+        let pawns = *self.board.pieces(Piece::Pawn) & own;
+        let en_passant = self.board.en_passant();
+        let en_passant_target = en_passant.map(|ep_sq| {
+            let forward_offset = if color == Color::White { 8 } else { -8 };
+            let target_index = square_index(ep_sq) as i32 + forward_offset;
+            square_from_index(target_index as usize)
+        });
+        
+        for source in pawns {
+            let quiets = get_pawn_quiets(source, color, occupied);
+            for dest in quiets {
+                if is_promotion_square(dest, color) {
+                    push_promotion_moves(&mut moves, source, dest);
+                } else {
+                    moves.push(ChessMove::new(source, dest, None));
+                }
+            }
+
+            let captures = get_pawn_attacks(source, color, enemy);
+            for dest in captures {
+                if is_promotion_square(dest, color) {
+                    push_promotion_moves(&mut moves, source, dest);
+                } else {
+                    moves.push(ChessMove::new(source, dest, None));
+                }
+            }
+
+            if let Some(target_sq) = en_passant_target {
+                let target_bb = BitBoard::from_square(target_sq);
+                if (get_pawn_attacks(source, color, target_bb) & target_bb) != EMPTY {
+                    moves.push(ChessMove::new(source, target_sq, None));
+                }
+            }
+        }
+
+        let knights = *self.board.pieces(Piece::Knight) & own;
+        for source in knights {
+            let destinations = get_knight_moves(source) & !own;
+            for dest in destinations {
+                moves.push(ChessMove::new(source, dest, None));
+            }
+        }
+
+        let bishops = *self.board.pieces(Piece::Bishop) & own;
+        for source in bishops {
+            let destinations = get_bishop_moves(source, occupied) & !own;
+            for dest in destinations {
+                moves.push(ChessMove::new(source, dest, None));
+            }
+        }
+
+        let rooks = *self.board.pieces(Piece::Rook) & own;
+        for source in rooks {
+            let destinations = get_rook_moves(source, occupied) & !own;
+            for dest in destinations {
+                moves.push(ChessMove::new(source, dest, None));
+            }
+        }
+
+        let queens = *self.board.pieces(Piece::Queen) & own;
+        for source in queens {
+            let destinations = (get_bishop_moves(source, occupied) | get_rook_moves(source, occupied)) & !own;
+            for dest in destinations {
+                moves.push(ChessMove::new(source, dest, None));
+            }
+        }
+
+        let kings = *self.board.pieces(Piece::King) & own;
+        for source in kings {
+            let destinations = get_king_moves(source) & !own;
+            for dest in destinations {
+                moves.push(ChessMove::new(source, dest, None));
+            }
+            self.add_castling_moves(source, color, occupied, &mut moves);
+        }
+
+        moves
+    }
+
+    fn add_castling_moves(
+        &self,
+        king_square: Square,
+        color: Color,
+        occupied: BitBoard,
+        moves: &mut Vec<ChessMove>,
+    ) {
+        let rights = self.board.castle_rights(color);
+        match color {
+            Color::White => {
+                if king_square != Square::E1 {
+                    return;
+                }
+
+                if rights.has_kingside()
+                    && self.board.piece_on(Square::H1) == Some(Piece::Rook)
+                    && self.board.color_on(Square::H1) == Some(Color::White)
+                {
+                    let path =
+                        BitBoard::from_square(Square::F1) | BitBoard::from_square(Square::G1);
+                    if (occupied & path) == EMPTY {
+                        moves.push(ChessMove::new(Square::E1, Square::G1, None));
+                    }
+                }
+
+                if rights.has_queenside()
+                    && self.board.piece_on(Square::A1) == Some(Piece::Rook)
+                    && self.board.color_on(Square::A1) == Some(Color::White)
+                {
+                    let path = BitBoard::from_square(Square::B1)
+                        | BitBoard::from_square(Square::C1)
+                        | BitBoard::from_square(Square::D1);
+                    if (occupied & path) == EMPTY {
+                        moves.push(ChessMove::new(Square::E1, Square::C1, None));
+                    }
+                }
+            }
+            Color::Black => {
+                if king_square != Square::E8 {
+                    return;
+                }
+
+                if rights.has_kingside()
+                    && self.board.piece_on(Square::H8) == Some(Piece::Rook)
+                    && self.board.color_on(Square::H8) == Some(Color::Black)
+                {
+                    let path =
+                        BitBoard::from_square(Square::F8) | BitBoard::from_square(Square::G8);
+                    if (occupied & path) == EMPTY {
+                        moves.push(ChessMove::new(Square::E8, Square::G8, None));
+                    }
+                }
+
+                if rights.has_queenside()
+                    && self.board.piece_on(Square::A8) == Some(Piece::Rook)
+                    && self.board.color_on(Square::A8) == Some(Color::Black)
+                {
+                    let path = BitBoard::from_square(Square::B8)
+                        | BitBoard::from_square(Square::C8)
+                        | BitBoard::from_square(Square::D8);
+                    if (occupied & path) == EMPTY {
+                        moves.push(ChessMove::new(Square::E8, Square::C8, None));
+                    }
+                }
+            }
+        }
     }
 
     fn apply_internal(&mut self, action: ChessMove) {
-        self.board = self.board.make_move_new(action);
+        if self.board.piece_on(action.get_dest()) == Some(Piece::King) {
+            self.captured_king = self.board.color_on(action.get_dest());
+        } else {
+            self.board = self.board.make_move_new(action);
+        }
         self.update_mental_boards();
     }
 
@@ -253,6 +424,9 @@ impl SelfPlayGame {
     }
 
     fn king_present(&self, color: Color) -> bool {
+        if self.captured_king == Some(color) {
+            return false;
+        }
         let kings = *self.board.pieces(Piece::King) & *self.board.color_combined(color);
         kings != EMPTY
     }
@@ -269,8 +443,8 @@ impl SelfPlayGame {
         }
     }
 
-    fn compute_visibility(&self, player: Color) -> HashSet<usize> {
-        let mut visible = HashSet::new();
+fn compute_visibility_bb(&self, player: Color) -> BitBoard {
+        let mut visible = EMPTY;
 
         for index in 0..BOARD_SQUARES {
             let square = square_from_index(index);
@@ -278,26 +452,25 @@ impl SelfPlayGame {
             let color = self.board.color_on(square);
 
             if piece.is_some() && color == Some(player) {
-                visible.insert(index);
+                visible |= BitBoard::from_square(square);
                 let attacks = self.piece_attacks(square, piece.unwrap(), player);
-                for target in attacks {
-                    visible.insert(square_index(target));
-                }
+                visible |= attacks;
 
                 if piece == Some(Piece::Pawn) {
                     let forward_offset: i32 = if player == Color::White { 8 } else { -8 };
                     let fwd_index = index as i32 + forward_offset;
                     if (0..BOARD_SQUARES as i32).contains(&fwd_index) {
-                        visible.insert(fwd_index as usize);
+                        let fwd_square = square_from_index(fwd_index as usize);
+                        visible |= BitBoard::from_square(fwd_square);
 
                         let rank = index / 8;
                         let start_rank = if player == Color::White { 1 } else { 6 };
                         if rank == start_rank {
-                            let fwd_square = square_from_index(fwd_index as usize);
                             if self.board.piece_on(fwd_square).is_none() {
                                 let dbl_index = index as i32 + 2 * forward_offset;
                                 if (0..BOARD_SQUARES as i32).contains(&dbl_index) {
-                                    visible.insert(dbl_index as usize);
+                                    let dbl_square = square_from_index(dbl_index as usize);
+                                    visible |= BitBoard::from_square(dbl_square);
                                 }
                             }
                         }
@@ -306,9 +479,43 @@ impl SelfPlayGame {
             }
         }
 
+        // Fix: Explicitly search for our pawns that attack the en passant square.
+        // We iterate all squares to avoid any BitBoard iterator issues, and use 
+        // `self.piece_attacks` to guarantee we get the correct attack pattern.
+        if let Some(ep_square) = self.board.en_passant() {
+            let forward_offset = if player == Color::White { 8 } else { -8 };
+            let target_index = square_index(ep_square) as i32 + forward_offset;
+            let target_bb = BitBoard::from_square(square_from_index(target_index as usize));
+
+            let mut can_en_passant = false;
+
+            for index in 0..BOARD_SQUARES {
+                let square = square_from_index(index);
+                if self.board.piece_on(square) == Some(Piece::Pawn)
+                    && self.board.color_on(square) == Some(player)
+                {
+                    // Utilize the verified piece_attacks function
+                    let attacks = self.piece_attacks(square, Piece::Pawn, player);
+                    if (attacks & target_bb) != EMPTY {
+                        can_en_passant = true;
+                        break;
+                    }
+                }
+            }
+
+            if can_en_passant {
+                if self.board.piece_on(ep_square) == Some(Piece::Pawn)
+                    && self.board.color_on(ep_square) == Some(opposite_color(player))
+                {
+                    visible |= BitBoard::from_square(ep_square);
+                }
+            }
+        }
+
         visible
     }
-
+    
+    
     fn captured_piece_vector(&self, current_player: Color) -> [f32; CPV_LEN] {
         let enemy = opposite_color(current_player);
         let counts = [
@@ -329,6 +536,7 @@ impl SelfPlayGame {
         cpv
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn encode_flat(&self) -> Vec<f32> {
         self.encode_flat_with_oracle(false)
     }
@@ -339,7 +547,7 @@ impl SelfPlayGame {
         let visible_squares = if oracle {
             None
         } else {
-            Some(self.compute_visibility(current_player))
+            Some(self.compute_visibility_bb(current_player))
         };
 
         let mut encoded = vec![0.0; BOARD_SQUARES * ENCODE_CHANNELS];
@@ -358,10 +566,11 @@ impl SelfPlayGame {
             };
             let base = view_index * ENCODE_CHANNELS;
             let square = square_from_index(index);
+            let square_bb = BitBoard::from_square(square);
 
             let is_visible = visible_squares
                 .as_ref()
-                .map(|set| set.contains(&index))
+                .map(|bb| (*bb & square_bb) != EMPTY)
                 .unwrap_or(true);
 
             if !is_visible {
@@ -475,6 +684,13 @@ impl SelfPlayGame {
         Ok(moves)
     }
 
+    fn legal_actions_uci(&self) -> Vec<String> {
+        self.legal_actions_internal()
+            .iter()
+            .map(|mv| mv.to_string())
+            .collect()
+    }
+
     fn apply(&mut self, py: Python, action: Py<PyAny>) -> PyResult<()> {
         let bound = action.bind(py);
         let uci = uci_from_py(&bound)?;
@@ -506,6 +722,11 @@ impl SelfPlayGame {
         kwargs.set_item("dtype", torch.getattr("float32")?)?;
         let tensor = tensor_fn.call((rows,), Some(&kwargs))?;
         Ok(tensor.unbind())
+    }
+
+    #[pyo3(signature = (oracle = false))]
+    fn encode_flattened(&self, oracle: bool) -> Vec<f32> {
+        self.encode_flat_with_oracle(oracle)
     }
 
     fn action_index(&self, py: Python, action: Py<PyAny>) -> PyResult<usize> {
@@ -804,6 +1025,28 @@ class SelfPlayGame:
         Ok(flatten_2d(rows))
     }
 
+    fn py_legal_actions_uci(game: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        let moves = game.call_method0("legal_actions")?;
+        let mut uci_list = Vec::new();
+        for mv in moves.try_iter()? {
+            let mv = mv?;
+            let uci: String = mv.call_method0("uci")?.extract()?;
+            uci_list.push(uci);
+        }
+        uci_list.sort();
+        Ok(uci_list)
+    }
+
+    fn rust_legal_actions_uci(game: &SelfPlayGame) -> Vec<String> {
+        let mut uci_list: Vec<String> = game
+            .legal_actions_internal()
+            .iter()
+            .map(|mv| mv.to_string())
+            .collect();
+        uci_list.sort();
+        uci_list
+    }
+
     #[test]
     fn regression_default_state() -> PyResult<()> {
         with_python(|py| {
@@ -831,6 +1074,10 @@ class SelfPlayGame:
 
             let py_encoded = py_encode_flat(&py_game)?;
             assert_eq!(rust_game.encode_flat(), py_encoded);
+
+            let py_actions = py_legal_actions_uci(&py_game)?;
+            let rust_actions = rust_legal_actions_uci(&rust_game);
+            assert_eq!(rust_actions, py_actions);
 
             let mv = chess_mod
                 .getattr("Move")?
@@ -885,6 +1132,10 @@ class SelfPlayGame:
             let py_encoded = py_encode_flat(&py_game)?;
             assert_eq!(rust_game.encode_flat(), py_encoded);
 
+            let py_actions = py_legal_actions_uci(&py_game)?;
+            let rust_actions = rust_legal_actions_uci(&rust_game);
+            assert_eq!(rust_actions, py_actions);
+
             Ok(())
         })
     }
@@ -921,7 +1172,97 @@ class SelfPlayGame:
                 .unwrap();
             assert_eq!(rust_idx, py_idx);
 
+            let py_actions = py_legal_actions_uci(&py_game)?;
+            let rust_actions = rust_legal_actions_uci(&rust_game);
+            assert_eq!(rust_actions, py_actions);
+
             Ok(())
         })
+    }
+
+    #[test]
+    fn en_passant_pawn_visibility() {
+        let fen = "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1";
+        let board = Board::from_str(fen).expect("valid en passant FEN");
+        let game = SelfPlayGame::new_internal(board);
+
+        let visible = game.compute_visibility_bb(Color::White);
+
+        println!("visibility: {visible}");
+
+        let pawn_square = Square::D5;
+        assert!((visible & BitBoard::from_square(pawn_square)) != EMPTY);
+
+        let mut attacks = EMPTY;
+        for index in 0..BOARD_SQUARES {
+            let square = square_from_index(index);
+            if game.board.color_on(square) == Some(Color::White) {
+                if let Some(piece) = game.board.piece_on(square) {
+                    attacks |= game.piece_attacks(square, piece, Color::White);
+                }
+            }
+        }
+        assert!((attacks & BitBoard::from_square(pawn_square)) == EMPTY);
+    }
+
+    #[test]
+    fn test_pseudo_legal_capturing_king() {
+        // White Queen on a2, Black King on e8. Black pawn on a7.
+        let fen = "4k3/p7/8/8/8/8/Q7/4K3 w - - 0 1";
+        let mut board = Board::from_str(fen).unwrap();
+        // White moves Queen to e6 (giving check)
+        board = board.make_move_new(ChessMove::from_str("a2e6").unwrap());
+        // Black ignores check and moves pawn
+        board = board.make_move_new(ChessMove::from_str("a7a6").unwrap());
+        
+        let mut game = SelfPlayGame::new_internal(board);
+        let moves = rust_legal_actions_uci(&game);
+        assert!(moves.contains(&"e6e8".to_string()));
+        
+        // Ensure apply_internal doesn't panic
+        game.apply_internal(ChessMove::from_str("e6e8").unwrap());
+        assert!(!game.king_present(Color::Black));
+    }
+
+    #[test]
+    fn test_pseudo_legal_castling_through_check() {
+        // Black rooks on d8 and f8 attack the castling paths for white. Black king on e8.
+        let fen = "3rkr2/8/8/8/8/8/8/R3K2R w KQ - 0 1";
+        let board = Board::from_str(fen).unwrap();
+        let mut game = SelfPlayGame::new_internal(board);
+        let moves = rust_legal_actions_uci(&game);
+        assert!(moves.contains(&"e1g1".to_string()));
+        assert!(moves.contains(&"e1c1".to_string()));
+        
+        // Ensure apply_internal doesn't panic
+        game.apply_internal(ChessMove::from_str("e1g1").unwrap());
+    }
+
+    #[test]
+    fn test_pseudo_legal_moving_into_check() {
+        // Black rook on f2. White King on e1.
+        let fen = "4k3/8/8/8/8/8/5r2/4K3 w - - 0 1";
+        let board = Board::from_str(fen).unwrap();
+        let mut game = SelfPlayGame::new_internal(board);
+        let moves = rust_legal_actions_uci(&game);
+        assert!(moves.contains(&"e1f1".to_string()));
+        assert!(moves.contains(&"e1f2".to_string()));
+        
+        // Ensure apply_internal doesn't panic
+        game.apply_internal(ChessMove::from_str("e1f1").unwrap());
+    }
+
+    #[test]
+    fn test_pseudo_legal_unpinning_piece() {
+        // White rook on e2. Black King on e8. Black Knight on e7.
+        let fen = "4k3/4n3/8/8/8/8/4R3/4K3 b - - 0 1";
+        let board = Board::from_str(fen).unwrap();
+        let mut game = SelfPlayGame::new_internal(board);
+        let moves = rust_legal_actions_uci(&game);
+        // Moving knight to c6 unpins it, exposing the king to the rook.
+        assert!(moves.contains(&"e7c6".to_string()));
+        
+        // Ensure apply_internal doesn't panic
+        game.apply_internal(ChessMove::from_str("e7c6").unwrap());
     }
 }

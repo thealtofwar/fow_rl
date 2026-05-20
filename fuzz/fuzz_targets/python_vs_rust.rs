@@ -128,6 +128,14 @@ class SelfPlayGame:
                         ):
                             if board.piece_at(fwd_sq) is None:
                                 visible.add(sq + 2 * forward_offset)
+
+        ep_sq = board.ep_square
+        if ep_sq is not None:
+            captured_sq = ep_sq - 8 if player == chess.WHITE else ep_sq + 8
+            if 0 <= captured_sq < 64:
+                ep_piece = board.piece_at(captured_sq)
+                if ep_piece and ep_piece.piece_type == chess.PAWN and ep_piece.color != player:
+                    visible.add(captured_sq)
         return visible
 
     def encode(self, oracle: bool = False):
@@ -243,6 +251,27 @@ fn py_encode_flat(game: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     Ok(flatten_2d(rows))
 }
 
+fn py_legal_actions_uci(game: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let moves = game.call_method0("legal_actions")?;
+    let mut uci_list = Vec::new();
+    for mv in moves.try_iter()? {
+        let mv = mv?;
+        let uci: String = mv.call_method0("uci")?.extract()?;
+        uci_list.push(uci);
+    }
+    uci_list.sort();
+    Ok(uci_list)
+}
+
+fn rust_legal_actions_uci(game: &fow_rl::SelfPlayGame) -> Vec<String> {
+    let mut uci_list: Vec<String> = fow_rl::fuzzing::legal_actions(game)
+        .iter()
+        .map(|mv| mv.to_string())
+        .collect();
+    uci_list.sort();
+    uci_list
+}
+
 fn compare_state(py_game: &Bound<'_, PyAny>, rust_game: &fow_rl::SelfPlayGame) -> PyResult<()> {
     let py_turn: bool = py_game.getattr("turn")?.extract()?;
     let rust_turn = fow_rl::fuzzing::is_white_to_move(rust_game);
@@ -270,6 +299,14 @@ fn compare_state(py_game: &Bound<'_, PyAny>, rust_game: &fow_rl::SelfPlayGame) -
     if fow_rl::fuzzing::encode_flat(rust_game) != py_encoded {
         return Err(PyErr::new::<pyo3::exceptions::PyAssertionError, _>(
             "encode mismatch",
+        ));
+    }
+
+    let py_actions = py_legal_actions_uci(py_game)?;
+    let rust_actions = rust_legal_actions_uci(rust_game);
+    if py_actions != rust_actions {
+        return Err(PyErr::new::<pyo3::exceptions::PyAssertionError, _>(
+            "legal actions mismatch",
         ));
     }
 
